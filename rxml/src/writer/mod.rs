@@ -20,6 +20,9 @@ const CDATA_SPECIALS: &'static [u8] = &[b'<', b'>', b'&', b'\r'];
 
 const ATTR_SPECIALS: &'static [u8] = &[b'"', b'\'', b'\r', b'\n', b'\t', b'<', b'>', b'&'];
 
+const CDATAOPEN: &'static str = "<![CDATA[";
+const CDATACLOSE: &'static str = "]]>";
+
 fn escape<'a, B: BufMut>(out: &'a mut B, data: &'a [u8], specials: &'static [u8]) {
 	let mut last_index = 0;
 	for i in 0..data.len() {
@@ -80,6 +83,15 @@ pub enum Item<'x> {
 
 	/// A piece of text (in element content, not attributes)
 	Text(&'x CDataStr),
+
+	/// A raw, unescaped piece of text (in element content, not attributes)
+	RawText(&'x str),
+
+	/// CDATA start <![CDATA[
+	CDataOpen,
+
+	/// CDATA close ]]>
+	CDataClose,
 
 	/// Footer of an element
 	///
@@ -536,6 +548,7 @@ enum EncoderState {
 	ElementHead,
 	Content,
 	EndOfDocument,
+	CDataSection,
 }
 
 /**
@@ -703,6 +716,29 @@ impl<T: TrackNamespace> Encoder<T> {
 					Ok(())
 				}
 				_ => Err(EncodeError::NoOpenElement),
+			},
+			Item::CDataOpen => match self.state {
+				EncoderState::Content => {
+					self.state = EncoderState::CDataSection;
+					output.put_slice(CDATAOPEN.as_bytes());
+					Ok(())
+				}
+				_ => Err(EncodeError::TextNotAllowed),
+			},
+			Item::CDataClose => match self.state {
+				EncoderState::CDataSection => {
+					self.state = EncoderState::Content;
+					output.put_slice(CDATACLOSE.as_bytes());
+					Ok(())
+				}
+				_ => Err(EncodeError::TextNotAllowed),
+			},
+			Item::RawText(s) => match self.state {
+				EncoderState::CDataSection => {
+					output.put_slice(s.as_bytes());
+					Ok(())
+				}
+				_ => Err(EncodeError::TextNotAllowed),
 			},
 			Item::Text(cdata) => match self.state {
 				EncoderState::Content => {
@@ -1402,6 +1438,27 @@ mod tests_encoder {
 			other => panic!("unexpected encode result: {:?}", other),
 		};
 		assert_eq!(&buf, &b"<x/>"[..]);
+	}
+
+	#[test]
+	fn encode_cdata_section() {
+		let mut enc = mkencoder();
+		let mut buf = Vec::new();
+		enc.encode(
+			Item::ElementHeadStart(None, "x".try_into().unwrap()),
+			&mut buf,
+		)
+		.unwrap();
+		enc.encode(Item::ElementHeadEnd, &mut buf).unwrap();
+		enc.encode(Item::CDataOpen, &mut buf).unwrap();
+		enc.encode(Item::RawText("this has special chars like &"), &mut buf)
+			.unwrap();
+		enc.encode(Item::CDataClose, &mut buf).unwrap();
+		enc.encode(Item::ElementFoot, &mut buf).unwrap();
+		assert_eq!(
+			String::from_utf8(buf).unwrap().as_str(),
+			"<x><![CDATA[this has special chars like &]]></x>"
+		);
 	}
 
 	#[test]
